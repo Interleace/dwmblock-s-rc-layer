@@ -1,0 +1,170 @@
+#!/bin/sh
+# dwmblocksctl - Userspace-Steuerung für dwmblocks
+#
+# Modi:	dwmblocks (normal), set (static) and loop
+#
+# Portiert aus: /etc/init.d/dwmblocks (Debian-init.d-Skript, USER=michael)
+# Änderung gegenüber Quelle:
+#   - lsb-init-functions (do_start/do_stop-Logging) entfernt: Systemnamensraum,
+#     hier irrelevant.
+#   - start-stop-daemon --chuid entfernt: kein Rollenwechsel nötig, das Skript
+#     läuft schon als der Benutzer, dem die X-Session gehört.
+#   - jedes `su - "$USER" -c ...` entfernt: xsetroot läuft direkt.
+#   - PIDFILE/STATEFILE-Konvention aus dem Original beibehalten
+#     (/run/user/$(id -u)), aber über $XDG_RUNTIME_DIR statt Handkonstruktion.
+
+set -eu
+
+NAME=dwmblocks
+DAEMON="${DWMBLOCKS_BIN:-$(command -v dwmblocks 2>/dev/null || echo /usr/local/bin/dwmblocks)}"
+RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+PIDFILE="$RUNTIME_DIR/$NAME.pid"
+STATEFILE="$RUNTIME_DIR/$NAME.state"
+LOOPPID="$RUNTIME_DIR/$NAME.loop.pid"
+: "${DISPLAY:=:0}"
+
+msg() { echo "$NAME: $*" >&2; }
+
+is_running() {
+    [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null
+}
+
+do_start() {
+    if is_running; then
+        msg "läuft bereits (pid $(cat "$PIDFILE"))"
+        return 0
+    fi
+    if is_looping; then
+	loop_stop
+	echo "Loop stopped."
+    fi
+    if [ ! -x "$DAEMON" ]; then
+        msg "kein ausführbares Binary unter '$DAEMON' (DWMBLOCKS_BIN setzen?)"
+        return 1
+    fi
+    "$DAEMON" &
+    echo $! > "$PIDFILE"
+    msg "gestartet (pid $!)"
+}
+
+do_stop() {
+    if is_running; then
+        kill "$(cat "$PIDFILE")"
+        rm -f "$PIDFILE"
+        msg "gestoppt"
+    else
+        msg "lief nicht"
+    fi
+}
+
+do_reload() {
+    if is_running; then
+        kill -USR1 "$(cat "$PIDFILE")"
+    else
+        msg "lief nicht, kein reload möglich"
+        return 1
+    fi
+}
+
+#do_set() {
+#    [ "$#" -eq 1 ] || { echo "Usage: $NAME set TEXT" >&2; exit 1; }
+#    printf '%s\n' "$1" > "$STATEFILE"
+#    xsetroot -display "$DISPLAY" -name "$1"
+#}
+
+do_set() {
+    if [ "$#" -gt 0 ]; then
+        text="$*"
+    else
+        [ -t 0 ] && { echo "Usage: $NAME set TEXT | ... | $NAME set" >&2; exit 1; }
+        text=$(cat)
+    fi
+    printf '%s\n' "$text" > "$STATEFILE"
+    xsetroot -display "$DISPLAY" -name "$text"
+}
+
+do_get() {
+    [ -f "$STATEFILE" ] || { msg "kein gespeicherter Status"; exit 1; }
+    cat "$STATEFILE"
+}
+
+do_clear() {
+    xsetroot -display "$DISPLAY" -name ""
+    rm -f "$STATEFILE"
+}
+
+do_reset() {
+    is_running && do_stop
+    rm -f "$STATEFILE"
+    do_start
+}
+
+is_looping() {
+    [ -f "$LOOPPID" ] &&
+        kill -0 "$(cat "$LOOPPID")" 2>/dev/null
+}
+
+loop_stop() {
+    if is_looping; then
+        kill "$(cat "$LOOPPID")"
+    fi
+    rm -f "$LOOPPID"
+}
+
+loop_body() {
+    interval=$1
+    shift
+
+    while :; do
+        if text=$("$@"); then
+            do_set "$text"
+        fi
+        sleep "$interval"
+    done
+}
+
+do_loop() {
+    if is_running; then
+    	do_stop
+	echo "Entered loop"
+    fi
+    case "${1:-}" in
+        stop)
+            loop_stop
+            return 0
+            ;;
+        ''|*[!0-9]*)
+            msg "Usage: $NAME loop SEKUNDEN BEFEHL [ARG...] | stop"
+            return 1
+            ;;
+    esac
+
+    [ "$1" -gt 0 ] && [ "$#" -ge 2 ] || {
+        msg "Usage: $NAME loop SEKUNDEN BEFEHL [ARG...] | stop"
+        return 1
+    }
+
+    loop_stop
+
+    loop_body "$@" </dev/null >/dev/null 2>&1 &
+    printf '%s\n' "$!" > "$LOOPPID"
+
+    msg "loop alle $1 s (pid $!)"
+}
+
+case "${1:-}" in
+    start)   do_start ;;
+    stop)    do_stop ;;
+    restart) do_stop; do_start ;;
+    reload)  do_reload ;;
+    set)     shift; do_set "$@" ;;
+    get)     do_get ;;
+    clear)   do_clear ;;
+    reset)   do_reset ;;
+    status)  is_running && echo "läuft" || echo "gestoppt" ;;
+    loop)    shift; do_loop "$@" ;;
+    *)
+        echo "Usage: $NAME {start|stop|restart|reload|status|set|get|clear|reset}" >&2
+        exit 1
+        ;;
+esac
